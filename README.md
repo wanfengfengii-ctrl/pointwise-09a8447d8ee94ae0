@@ -1,0 +1,33 @@
+# 澄桥冷却服务事故复盘
+
+澄桥工厂公用工程班组用这个库核对冷却服务事故。检修员从设备台账登记部件参数，从巡检表登记现场读数。工艺员按工艺图发布有序路线。复盘员用已经核实的部件实况定位受阻级，接班员按固定号码领取简报。共用部件在整版拓扑中沿用同一物理身份。新修订可以供下一次冻结使用，原事故和原简报仍可按号核对。
+
+## 运行
+
+使用 Python 3.11 标准库，从项目根目录运行。数据演示使用独立临时 SQLite 数据库。
+
+```sh
+python3 -B -S -m unittest discover -s tests -v
+python3 -B -S -m tests.fixtures
+```
+
+## 从登记到交班
+
+公共函数以 `sqlite3.Connection` 为首参。每个连接在首次写入前依次调用 `AssetRepository(db).initialize()`、`LayoutRepository(db).initialize()`、`EvidenceRepository(db).initialize()` 和 `BriefRepository(db).initialize()`。各初始化仅补齐所属表，目录初始化为当前连接开启外键检查。写入口管理自己的事务，请在连接没有未完成事务时调用。
+
+1. 检修员用 `put_asset(db, asset_id, description, availability)` 追加参数修订。身份为非空且首尾无空白的字符串，说明为字符串，可用率为 `[0, 1]` 内的 `Fraction`，无量纲。`get_asset_revision(db, revision_id)` 读历史，`get_current_asset_revision(db, asset_id)` 读最近一次成功登记的参数。精确分子分母以十六进制文本保存。
+2. 工艺员用 `save_layout(db, stages)` 发布工艺图，输入为非空有序级序列。`Stage` 含非空的有序 `Route` 序列，路线含非空的有序 `AssetReference(asset_id, revision_id)` 序列。级名在同版唯一，路线名在所属级唯一。`load_layout_revision(db, revision_id)` 按原顺序读回，引用精确到每个部件修订。同版重复出现的物理部件使用同一个目录修订。
+3. 检修员用 `put_observations(db, incident_key, layout_revision_id, readings)` 登记一批现场级读数。传入映射或 `(级名, bool)` 对的可迭代对象。每批描述本次所有已知级，空批表示全线未测。批次内重复级、拓扑外的级和非布尔值使整批被拒绝。
+4. 复盘员用 `freeze_incident(db, layout_revision_id, observation_revision_id)` 冻结明确的父项。两个父项必须存在，读数所属拓扑号必须等于入参拓扑号。`load_incident(db, incident_id)` 读回固定上下文，`observations.reading_for(stage_name)` 返回 `True`、`False` 或未观测的 `None`。
+5. 复盘员提交映射或 `(部件 ID, bool)` 对的可迭代对象。实况须恰好覆盖整版成员，缺项、冗余项、重复项或非布尔值均被拒绝。
+6. `replay_incident(db, incident_id, component_states)` 返回固定上下文、实况、逐级结果、受阻级及读数差异。路线内全部部件可用才通行。级内至少一路通行才通行。整线要求所有级通行。即使前级受阻，仍计算所有后续级和各自全部可用路线。结果按工艺图次序展示，仅明确读数参与差异比较。实况以物理部件首次出现顺序归一化。
+7. `issue_brief(db, incident_id, component_states)` 用同一回放入口核对并签发，提交成功后返回简报号。输入错误或 SQLite 写入及提交中止时，该次签发无可领取结果。
+8. `read_brief(db, brief_id)` 领取原快照，包含事故键和三个固定父项号、级路线和部件修订引用、每级读数与通行结果、完整实况、受阻级和差异。目录更正、读数补报、拓扑再发布及数据库重开后可按原号码读取。
+
+参数与结构错误分别由 `InvalidAsset`、`InvalidLayout`、`InvalidObservations`、`InvalidIncidentBinding`、`InvalidStateVector` 表示，均为 `ValueError` 子类。查无固定记录使用对应的 `LookupError` 子类 `UnknownAssetRevision`、`UnknownLayoutRevision`、`UnknownIncident` 或 `UnknownBrief`。简报存储错误保留 SQLite 错误类型，调用方可在故障解除后重试。
+
+## 手算例
+
+取冷却部件 `X`、`A`、`B`。进水级 `intake` 有由 `X` 支撑的 `main` 和由 `A` 支撑的 `backup`。净化级 `polish` 的 `supply` 需要 `X` 与 `B`。若 `X=False`、`A=True`、`B=True`，进水仅备用路线可用，净化受阻，整线不通。若现场只登记 `polish=True`，唯一差异是净化现场通行、回放不通。进水读数仍为 `None`。
+
+演示签发这份诊断，再更正 `X` 的参数并将现场补报提交为另一批读数。接班员重开后领取旧号，仍看到原两级工艺图、原参数引用和上述诊断。回归另用非字典序的级路线核对多处受阻、下游可行路线和明确不通的现场读数。
