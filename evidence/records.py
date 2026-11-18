@@ -20,3 +20,12 @@ class FrozenIncident:
     incident_id: int
     layout_revision_id: int
     observation_revision_id: int
+
+
+@dataclass(frozen=True)
+class CarryRecord:
+    derived_observation_id: int
+    source_observation_id: int
+    old_layout_id: int
+    new_layout_id: int
+    matches: tuple[tuple[str, str, bool], ...]

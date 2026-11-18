@@ -8,9 +8,11 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from catalog import put_asset
-from evidence import EvidenceRepository, put_observations
+from evidence import (EvidenceRepository, carry_observations, freeze_incident, load_incident,
+                      put_observations, read_carry)
 from tests.fixtures import initialize_database
-from topology import AssetReference, Route, Stage, load_layout_revision, save_layout
+from topology import (AssetReference, Route, Stage, eligible_stage_pairs, load_layout_revision,
+                      save_layout)
 
 
 INCIDENT_KEY = "冷却改版巡检"
@@ -119,15 +121,138 @@ def check_fault_fixture(db: sqlite3.Connection, cases: CarryCases) -> None:
         raise AssertionError("failed commit changed the observation batches")
 
 
+def check_carry_example(db: sqlite3.Connection, cases: CarryCases) -> None:
+    """Exercise the documented alignment, ambiguity, empty batch and fault retry."""
+    candidates = eligible_stage_pairs(db, cases.old_layout_id, cases.new_layout_id)
+    if candidates != (("Z", "R"), ("A", "R"), ("M", "S")):
+        raise AssertionError(f"unexpected candidates {candidates!r}")
+    full_id = carry_observations(db, cases.full_source_id, cases.new_layout_id)
+    incident_id = freeze_incident(db, cases.new_layout_id, full_id)
+    readings = load_incident(db, incident_id).observations
+    if readings.reading_for("R") is not None or readings.reading_for("S") is not False:
+        raise AssertionError(f"unexpected carried readings {readings.readings!r}")
+    expected = {
+        "source_observation_id": cases.full_source_id,
+        "old_layout_id": cases.old_layout_id,
+        "new_layout_id": cases.new_layout_id,
+        "matches": (("M", "S", False),),
+    }
+    if read_carry(db, full_id) != expected:
+        raise AssertionError(f"unexpected carry record {read_carry(db, full_id)!r}")
+    partial_id = carry_observations(db, cases.partial_source_id, cases.new_layout_id)
+    if read_carry(db, partial_id)["matches"] != ():
+        raise AssertionError("a partial source with no explicit aligned reading must carry nothing")
+    if EvidenceRepository(db).find_observations(partial_id).readings != ():
+        raise AssertionError("the partial derived batch must stay empty")
+    empty_id = carry_observations(db, cases.full_source_id, cases.no_match_layout_id)
+    if read_carry(db, empty_id)["matches"] != ():
+        raise AssertionError("a target with no equivalent stages must carry nothing")
+    crossed_id = carry_observations(db, cases.crossed_source_id, cases.crossed_new_layout_id)
+    if read_carry(db, crossed_id)["matches"] != ():
+        raise AssertionError("two competing maximum alignments must carry nothing")
+    crossed_incident = freeze_incident(db, cases.crossed_new_layout_id, crossed_id)
+    crossed_readings = load_incident(db, crossed_incident).observations
+    if (crossed_readings.reading_for("U"), crossed_readings.reading_for("V")) != (None, None):
+        raise AssertionError("ambiguous stages must stay unobserved")
+
+
+def check_carry_fault(db: sqlite3.Connection, cases: CarryCases) -> None:
+    """A failed commit leaves no derived batch or source and a retry succeeds."""
+    before = {
+        table: db.execute(f"SELECT count(*) FROM {table}").fetchone()
+        for table in ("observation_revision", "observation_reading", "carry_batch", "carry_match")
+    }
+    with fail_observation_commit(db):
+        try:
+            carry_observations(db, cases.full_source_id, cases.new_layout_id)
+        except sqlite3.IntegrityError as exc:
+            if str(exc) != "FOREIGN KEY constraint failed":
+                raise
+        else:
+            raise AssertionError("fixture did not reject the carry commit")
+        if db.in_transaction:
+            raise AssertionError("failed carry commit left an active transaction")
+    after = {
+        table: db.execute(f"SELECT count(*) FROM {table}").fetchone()
+        for table in ("observation_revision", "observation_reading", "carry_batch", "carry_match")
+    }
+    if after != before:
+        raise AssertionError("failed carry commit left a derived batch or source behind")
+    retried_id = carry_observations(db, cases.full_source_id, cases.new_layout_id)
+    if read_carry(db, retried_id)["matches"] != (("M", "S", False),):
+        raise AssertionError("retry after the fault did not publish the carried match")
+
+
+def check_reopened_carry(db: sqlite3.Connection, cases: CarryCases) -> dict:
+    """Read the published derivation back by number without recomputing."""
+    full_id = carry_observations(db, cases.full_source_id, cases.new_layout_id)
+    published = read_carry(db, full_id)
+    reopened = read_carry(db, full_id)
+    if reopened != published:
+        raise AssertionError(f"reopened carry record changed: {reopened!r}")
+    return published
+
+
+def demo() -> None:
+    """Show the real endpoints: candidates, explicit False carry, ambiguity, empty batch, reopen."""
+    with TemporaryDirectory() as directory:
+        path = Path(directory) / "demo.sqlite3"
+        with closing(sqlite3.connect(path)) as db:
+            initialize_database(db)
+            cases = seed_cases(db)
+            candidates = eligible_stage_pairs(db, cases.old_layout_id, cases.new_layout_id)
+            full_id = carry_observations(db, cases.full_source_id, cases.new_layout_id)
+            incident_id = freeze_incident(db, cases.new_layout_id, full_id)
+            readings = load_incident(db, incident_id).observations
+            crossed_id = carry_observations(db, cases.crossed_source_id, cases.crossed_new_layout_id)
+            crossed_incident = freeze_incident(db, cases.crossed_new_layout_id, crossed_id)
+            crossed_readings = load_incident(db, crossed_incident).observations
+            empty_id = carry_observations(db, cases.full_source_id, cases.no_match_layout_id)
+            before_supplement = {
+                "candidates": candidates,
+                "r_reading": readings.reading_for("R"),
+                "s_reading": readings.reading_for("S"),
+                "full_carry": read_carry(db, full_id),
+                "crossed_carry": read_carry(db, crossed_id),
+                "crossed_u": crossed_readings.reading_for("U"),
+                "crossed_v": crossed_readings.reading_for("V"),
+                "empty_carry": read_carry(db, empty_id),
+                "empty_incident": load_incident(
+                    db, freeze_incident(db, cases.no_match_layout_id, empty_id)).observations.readings,
+            }
+            put_observations(db, INCIDENT_KEY, cases.new_layout_id, (("S", True),))
+        with closing(sqlite3.connect(path)) as db:
+            reopened = read_carry(db, full_id)
+            source = EvidenceRepository(db).find_observations(reopened["source_observation_id"])
+            old_layout = load_layout_revision(db, reopened["old_layout_id"])
+            new_layout = load_layout_revision(db, reopened["new_layout_id"])
+            after_supplement = {
+                "reopened_full_carry": reopened,
+                "source_readings": EvidenceRepository(db).find_observations(
+                    cases.full_source_id).readings,
+                "source_still": source.readings,
+                "old_stages": [stage.name for stage in old_layout.stages],
+                "new_stages": [stage.name for stage in new_layout.stages],
+                "per_stage_sources": {
+                    old_name: {"new_stage": new_name, "reading": value}
+                    for old_name, new_name, value in reopened["matches"]
+                },
+            }
+    print(json.dumps({"demo": before_supplement, "reopened": after_supplement}, ensure_ascii=False))
+
+
 def main() -> None:
     with TemporaryDirectory() as directory:
         path = Path(directory) / "carry.sqlite3"
         with closing(sqlite3.connect(path)) as db:
             initialize_database(db)
             cases = seed_cases(db)
-            check_fault_fixture(db, cases)
-        with closing(sqlite3.connect(path)) as db:
             check_seed(db, cases)
+            check_fault_fixture(db, cases)
+            check_carry_example(db, cases)
+            check_carry_fault(db, cases)
+        with closing(sqlite3.connect(path)) as db:
+            published = check_reopened_carry(db, cases)
             source = EvidenceRepository(db).find_observations(cases.full_source_id)
             target = load_layout_revision(db, cases.new_layout_id)
             print(json.dumps({
@@ -135,6 +260,7 @@ def main() -> None:
                 "source_readings": source.readings,
                 "target_layout_id": target.revision_id,
                 "target_stages": [stage.name for stage in target.stages],
+                "reopened_carry": published,
             }, ensure_ascii=False))
 
 

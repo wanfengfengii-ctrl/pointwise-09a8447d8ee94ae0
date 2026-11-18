@@ -8,8 +8,10 @@
 
 ```sh
 python3 -B -S -m unittest discover -s tests -v
-python3 -B -S -m tests.fixtures
+python3 -B -S -m demo_scenarios
 ```
+
+`demo_scenarios` 依次运行原简报手算例和承接演示。`python3 -B -S -m tests.fixtures` 仍单独核对原简报价，`python3 -B -S -m carry_examples` 核对承接种子、临时库重开与提交失败夹具。
 
 ## 从登记到交班
 
@@ -25,6 +27,16 @@ python3 -B -S -m tests.fixtures
 8. `read_brief(db, brief_id)` 领取原快照，包含事故键和三个固定父项号、级路线和部件修订引用、每级读数与通行结果、完整实况、受阻级和差异。目录更正、读数补报、拓扑再发布及数据库重开后可按原号码读取。
 
 参数与结构错误分别由 `InvalidAsset`、`InvalidLayout`、`InvalidObservations`、`InvalidIncidentBinding`、`InvalidStateVector` 表示，均为 `ValueError` 子类。查无固定记录使用对应的 `LookupError` 子类 `UnknownAssetRevision`、`UnknownLayoutRevision`、`UnknownIncident` 或 `UnknownBrief`。简报存储错误保留 SQLite 错误类型，调用方可在故障解除后重试。
+
+## 跨版读数承接
+
+改版后可把指定旧批的明确读数承接进新版，规则见 CARRY.md。三项公开入口：
+
+- `topology.eligible_stage_pairs(db, old_layout_id, new_layout_id)` 只读列出两版之间通行语义等价的 `(旧级名, 新级名)`，先按旧版级序、同一旧级按新版级序排列。级语义只看路线与部件 ID：级是各路线之“或”，路线是部件之“与”，同一物理部件共用一个布尔变量，因此重复部件、路线拆分与参数修订号都不改变等价判断。
+- `evidence.carry_observations(db, source_observation_id, new_layout_id)` 登记派生批次并返回其号。两版全级序做一对一保序对齐，只有在每一种最大基数对齐中都出现的旧新级对才承接该旧级的明确读数（`False` 也算明确）；归属不确定的级留待实测。无承接也登记合法空批。源批不变，派生批沿用源批事故键、按目标版级序存放，可直接冻结。
+- `evidence.read_carry(db, derived_observation_id)` 返回 `source_observation_id`、`old_layout_id`、`new_layout_id` 与按新版级序排列的 `matches`。按号读取已发布来源，不重新比较拓扑或对齐。未知号或用直接批号查询报 `UnknownCarry`，未知源批报 `UnknownObservation`（均为 `LookupError`）。
+
+派生批次、`carry_batch` 与 `carry_match` 在同一事务内提交；写入或提交失败保留 SQLite 错误且整次无留存，故障排除后可重试。后续参数更正、拓扑再发布、读数补报与关闭重开均不改变已发布批次与来源。`python3 -B -S -m carry_examples` 核对种子、临时库重开与提交失败夹具。
 
 ## 手算例
 

@@ -2,6 +2,7 @@ from .definition import AssetReference as AssetReference
 from .definition import LayoutRevision as LayoutRevision
 from .definition import Route as Route
 from .definition import Stage as Stage
+from .equivalence import eligible_stage_pairs as eligible_stage_pairs
 from .layout import UnknownLayoutRevision as UnknownLayoutRevision
 from .layout import load_layout_revision as load_layout_revision
 from .layout import save_layout as save_layout

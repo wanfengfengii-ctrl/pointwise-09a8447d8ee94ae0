@@ -3,5 +3,5 @@
   "kind": "cli",
   "setup": [],
   "verify": ["python3", "-B", "-S", "-m", "unittest", "discover", "-s", "tests", "-v"],
-  "demo": ["python3", "-B", "-S", "-m", "tests.fixtures"]
+  "demo": ["python3", "-B", "-S", "-m", "demo_scenarios"]
 }
